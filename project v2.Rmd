@@ -1,0 +1,144 @@
+---
+title: "Practical Machine Learning Project"
+output: html_document
+---
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. One application of this data is to determine how well the user is performing a particulat activity. In this project, the data available is from accelerometers on the belt, forearm, arm, and dumbell of 6 participants asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+The goal is to predict the manner in which they did the exercise. (This is the "classe" variable.) More info on the project and the data, plus training and test sets are provided at http://groupware.les.inf.puc-rio.br/har (section on the Weight Lifting Exercise Dataset). 
+
+Reading the data:
+```{r cache=TRUE}
+tr <- read.csv("pml-training.csv", strip.white=TRUE, na.strings=c("", "NA"))
+```
+There are 19622 obs. of  160 variables. The variable for which the model will be built is classe. Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes (more about the data at http://groupware.les.inf.puc-rio.br/har#ixzz3UfFThCT8). The distribution of its values is shown in the figure. 
+
+```{r fig.width=3, fig.height=3}
+plot(tr$classe, xlab = "classe", ylab = "Counts")
+```
+
+A deeper inspection of the data shows that many of the variables have missing values. In fact there are 100 variables that have 19216 missing values each. The following code removes those variables. The rest of the variables (60) have no missing values. Similar treatment could be achieved using nearZeroVar(). 
+Variable X will also bee excluded from the models as it is the sample number. If we assume that the prediction must be based only on accelerometer data, so that the model is applicable to future users and circumstances, and in order to prevent overfitting, we should remove the following variables as well: user_name, new_window, num_window, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp. 
+
+```{r results='hide', message=FALSE}
+library(caret)
+numMiss <- colSums(is.na(tr))
+length(numMiss[numMiss>0])   ## this returns 100
+tr2 <- tr[colSums(is.na(tr)) == 0]
+tr2 <- subset(tr2, select=-c(X, user_name, new_window, num_window, raw_timestamp_part_1,
+                             raw_timestamp_part_2, cvtd_timestamp))
+```
+
+Now I will look for highly correlated variables. Correlation operations only apply to numeric variables (there are 52 of them). (After removing non-accelerometer variables, the only non-numeric variable is classe). Function findCorrelation, from the caret package, filters variables at correlation > 0.80 and outputs a vector of indices denoting the columns to remove.
+
+```{r cache=TRUE}
+tr2NumVars <- tr2[sapply(tr2,is.numeric)==TRUE]
+M <- abs(cor(tr2NumVars))
+highlyCor <- findCorrelation(M, cutoff = .80, verbose = FALSE)
+tr2NumNonCorrelated <- tr2NumVars[,-highlyCor]         #40 vars
+#now add back factor variables, including classe variable
+tr2NonNumVars <- tr2[sapply(tr2,is.numeric)!=TRUE]     #1 var
+tr2Clean <- cbind(tr2NumNonCorrelated, tr2NonNumVars)  # 41 vars
+```
+
+The training process will be as follows:  
+
+1. separate the training set (just derived from pml-training.csv) into test and training samples. 
+2. experiment on a sample of this test set with models and parameters and choice of predictors, using cross validation. 
+3. construct the best model according to previous step using the training set
+4. apply model to the test set to obtain the out-of-sample error of the selected model (cf. lecture on cross validation: *"if you cross-validate to pick predictors, you must estimate errors on independent data"*)
+5. apply model to obtain predictions on the test set pml-testing.csv provided
+
+These steps are developed in what follows. First, we obtain a training and test set so that we can evaluate various algorithms and subsets of predictors. 
+```{r}
+inTrain <- createDataPartition(y=tr2Clean$classe, p=.75, list=FALSE)
+tr2CleanTraining <- tr2Clean[inTrain,]
+tr2CleanTesting <- tr2Clean[-inTrain,]
+```
+
+
+The first attempt at building a model is using CART:
+```{r message=FALSE}
+set.seed(1235)
+fitControl <- trainControl(method = "repeatedcv",number = 5)## 5-fold CV
+modFitTree <- train(classe ~ ., method="rpart",data=tr2CleanTraining, trControl = fitControl)
+```
+
+The accuracy of this model is only 50.03%. 
+
+Next, random forest models are explored. Because of insufficient memory, I will experiment with a sample of 5000 observations
+
+```{r message=FALSE}
+library(randomForest)
+trSample5000 <- tr2CleanTraining[sample(nrow(tr2CleanTraining), 5000),]
+
+modFitRF5000<- randomForest(classe ~ ., method="rf",data=trSample5000,
+                        importance=TRUE, proximity=TRUE)
+```
+These are the model results: 
+```{r echo=FALSE}
+modFitRF5000
+```
+
+
+Function varImp provides info on the importance of the predictors in this model. According to this analysis, the top 20 predictors are selected in order to build the final mode.
+```{r}
+imp <- varImp(modFitRF5000, scale=FALSE)
+topPredictors <- rownames(imp)[order(imp$A, decreasing=TRUE)][1:20]
+trSample5000TopPredictors <- trSample5000[c(topPredictors, "classe")]
+```
+We can now build and evaluate another model with only this predictors.
+```{r cache=TRUE}
+modFitRF5000TopPredictors<- 
+  randomForest(classe ~ ., method="rf",data=trSample5000TopPredictors, importance=TRUE, proximity=TRUE)
+```
+The OOB estimate of error rate is slightly increased (3.08%), so all the variables will be maintained (41). 
+
+Now, linear discriminant analysis is explored. The following model produced 64% accuracy on cross validation with the 5000 samples:
+```{r message=FALSE}
+modFitLDA5000 <- train(classe ~ ., method="lda",data=trSample5000, trControl = fitControl)
+```
+It is worth noting that the time for building this model was rather smaller than for the other models. 
+
+Finally, a Naive Bayes model is explored. The following model produced 56% accuracy on cross validation with the 5000 samples:
+```{r cache=TRUE,message=FALSE, warning=FALSE}
+modFitNB5000 <- train(classe ~ ., method="nb",data=trSample5000, trControl = fitControl)
+```
+
+Note: I run out of memory when trying to build random forest models on the complete set (or a very large number of samples) with the best 20 variables and also when using boosting models on 1000 random samples.
+
+
+Given all these experiments, it seems that a random forest model is suitable for this problem. The final model will be built on the training set (tr2CleanTraining) and evaluated on the test set (tr2CleanTesting) to compute its OOB estimate of  error rate (1-accuracy) plus the estimate confidence. Given that there is not enough memory for building a random forest problem on the complete set, sampling is used first. The result follows. 
+```{r cache=TRUE}
+trNewSample5000 <- tr2CleanTraining[sample(nrow(tr2CleanTraining), 5000),]
+modFitFinal<- randomForest(classe ~ ., method="rf",data=trNewSample5000, importance=TRUE, proximity=TRUE)
+tr2CleanTestingPredictions <- predict(modFitFinal, newdata=tr2CleanTesting)
+confusionMatrix(tr2CleanTestingPredictions, tr2CleanTesting$classe)
+```
+
+This model is used to predict the class for the samples in pml-testing.csv.
+```{r cache=TRUE}
+#Read the test set
+test <- read.csv("pml-testing.csv", strip.white=TRUE, na.strings=c("", "NA"))
+```
+```{r}
+answers <- predict(modFitFinal, newdata=test)
+answers
+```
+
+Finally, files are created for Coursera submission:
+```{r}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+# create one file for each submission
+setwd(paste(getwd(),"/answerfiles",sep=""))
+pml_write_files(answers)
+```
+
+After uploading the answers, 19 0f 20 are correct. The only incorrect answer is for sample #19. 
+
+
